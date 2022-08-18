@@ -277,6 +277,7 @@ int main (int argc, char **argv) {
   struct event partEvents[2];
   for (int i = 0; i < sizeof(parts) / sizeof(struct note); i++) {
     partEvents[i] = (struct event) {parseTime(parts[i].start), parseTime(parts[i].end), parts[i].description};
+  }
 
   // --> do something so that events are printed out while they occur...
 
