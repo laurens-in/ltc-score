@@ -1,6 +1,8 @@
 //  gcc -o jltcdump-simple jltcdump-simple.c `pkg-config --cflags --libs jack ltc`/
 
-/*
+/* jack linear time code decoder
+ * Copyright (C) 2006, 2012, 2013 Robin Gareus
+ *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation; either version 2 of the License, or
@@ -23,35 +25,44 @@
 #define VERSION "1"
 #endif
 
-#define NR_OF_PARTS 12
-#define NR_OF_MINUTES 110
+#ifdef WIN32
+#include <windows.h>
+#include <pthread.h>
+#define pthread_t //< override jack.h def
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include <getopt.h>
-#include <signal.h>
 
 #include <jack/jack.h>
 #include <ltc.h>
 #include <ncurses.h>
 
+#ifndef WIN32
+#include <sys/mman.h>
+#include <signal.h>
+#include <pthread.h>
+#endif
+
+#define NR_OF_PARTS 12
+#define NR_OF_MINUTES 110
+
 static int keep_running = 1;
 
 static jack_port_t *input_port = NULL;
 static jack_client_t *j_client = NULL;
-static uint32_t j_samplerate = 41000;
+static uint32_t j_samplerate = 48000;
 
 static LTCDecoder *decoder = NULL;
 
 static pthread_mutex_t ltc_thread_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t data_ready = PTHREAD_COND_INITIALIZER;
 
-static int fps_num = 30;
+static int fps_num = 25;
 static int fps_den = 1;
-
-struct event *partmap[NR_OF_MINUTES];
 
 // represent event in score
 struct event
@@ -61,6 +72,8 @@ struct event
   char *notes;
   char *endsWith;
 };
+
+struct event *partmap[NR_OF_MINUTES];
 
 /**
  * jack audio process callback
@@ -87,7 +100,6 @@ void jack_shutdown(void *arg)
   fprintf(stderr, "recv. shutdown request from jackd.\n");
   keep_running = 0;
   pthread_cond_signal(&data_ready);
-  pthread_mutex_unlock(&ltc_thread_lock);
 }
 
 /**
@@ -118,6 +130,9 @@ static int init_jack(const char *client_name)
 
   jack_set_process_callback(j_client, process, 0);
 
+#ifndef WIN32
+  jack_on_shutdown(j_client, jack_shutdown, NULL);
+#endif
   j_samplerate = jack_get_sample_rate(j_client);
   return (0);
 }
@@ -165,7 +180,7 @@ static void my_decoder_read(LTCDecoder *d)
   {
 
     SMPTETimecode stime;
-    ltc_frame_to_time(&stime, &frame.ltc, 0);
+    ltc_frame_to_time(&stime, &frame.ltc, /* use_date? LTC_USE_DATE : */ 0);
 
     erase();
     attron(COLOR_PAIR(3));
@@ -210,8 +225,7 @@ static void my_decoder_read(LTCDecoder *d)
  */
 static void main_loop(void)
 {
-  // added while not sure if that makes sense
-  while (pthread_mutex_lock(&ltc_thread_lock) == 0);
+  pthread_mutex_lock(&ltc_thread_lock);
 
   while (keep_running)
   {
@@ -226,12 +240,12 @@ static void main_loop(void)
 
 void catchsig(int sig)
 {
+#ifndef _WIN32
+  signal(SIGHUP, catchsig);
+#endif
   fprintf(stderr, "caught signal - shutting down.\n");
   keep_running = 0;
   pthread_cond_signal(&data_ready);
-  pthread_mutex_unlock(&ltc_thread_lock);
-  jack_client_close(j_client);
-  exit(0);
 }
 
 /**************************
@@ -281,9 +295,8 @@ static int decode_switches(int argc, char **argv)
     break;
 
     case 'V':
-      printf("timecode for RT60, based on Robin Gareus' jack-ltc-dump %s\n\n", VERSION);
+      printf("jltcdump-simple version %s\n\n", VERSION);
       printf("Copyright (C) GPL 2006,2012,2013 Robin Gareus <robin@gareus.org>\n");
-      printf("Copyright (C) GPL 2022 Laurens Inauen\n");
       exit(0);
 
     case 'h':
@@ -297,14 +310,13 @@ static int decode_switches(int argc, char **argv)
   return optind;
 }
 
-
 int main(int argc, char **argv)
 {
   int i;
 
   i = decode_switches(argc, argv);
 
-  signal(SIGINT, catchsig);
+  // -=-=-= INITIALIZE =-=-=-
 
   initscr();
   curs_set(0);
@@ -350,13 +362,19 @@ int main(int argc, char **argv)
       partmap[j] = &parts[i];
     }
   }
-  // --> do something so that events are printed out while they occur...
 
-  if (init_jack("timecodeRT60"))
+  if (init_jack("jack-ltc-dump"))
     goto out;
 
   if (jack_portsetup())
     goto out;
+
+#ifndef WIN32
+  if (mlockall(MCL_CURRENT | MCL_FUTURE))
+  {
+    fprintf(stderr, "Warning: Can not lock memory.\n");
+  }
+#endif
 
   if (jack_activate(j_client))
   {
@@ -365,6 +383,11 @@ int main(int argc, char **argv)
   }
 
   jack_port_connect(&(argv[i]), argc - i);
+
+#ifndef _WIN32
+  signal(SIGHUP, catchsig);
+  signal(SIGINT, catchsig);
+#endif
 
   printw("ready...\n");
   refresh();
@@ -379,7 +402,6 @@ out:
   }
   ltc_decoder_free(decoder);
   fprintf(stderr, "bye.\n");
-  endwin();
 
   return (0);
 }
