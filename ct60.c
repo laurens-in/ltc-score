@@ -1,6 +1,8 @@
 //  gcc -o jltcdump-simple jltcdump-simple.c `pkg-config --cflags --libs jack ltc`/
 
-/*
+/* jack linear time code decoder
+ * Copyright (C) 2006, 2012, 2013 Robin Gareus
+ *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation; either version 2 of the License, or
@@ -23,35 +25,36 @@
 #define VERSION "1"
 #endif
 
-#define NR_OF_PARTS 12
-#define NR_OF_MINUTES 110
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include <getopt.h>
-#include <signal.h>
 
 #include <jack/jack.h>
 #include <ltc.h>
 #include <ncurses.h>
 
+#include <sys/mman.h>
+#include <signal.h>
+#include <pthread.h>
+
+#define NR_OF_PARTS 12
+#define NR_OF_MINUTES 110
+
 static int keep_running = 1;
 
 static jack_port_t *input_port = NULL;
 static jack_client_t *j_client = NULL;
-static uint32_t j_samplerate = 41000;
+static uint32_t j_samplerate = 44100;
 
 static LTCDecoder *decoder = NULL;
 
 static pthread_mutex_t ltc_thread_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t data_ready = PTHREAD_COND_INITIALIZER;
 
-static int fps_num = 30;
+static int fps_num = 25;
 static int fps_den = 1;
-
-struct event *partmap[NR_OF_MINUTES];
 
 // represent event in score
 struct event
@@ -60,7 +63,11 @@ struct event
   char *sectionName;
   char *notes;
   char *endsWith;
+  // super dumb but no time for smart solutions
+  int length;
 };
+
+struct event *partmap[NR_OF_MINUTES];
 
 /**
  * jack audio process callback
@@ -87,7 +94,6 @@ void jack_shutdown(void *arg)
   fprintf(stderr, "recv. shutdown request from jackd.\n");
   keep_running = 0;
   pthread_cond_signal(&data_ready);
-  pthread_mutex_unlock(&ltc_thread_lock);
 }
 
 /**
@@ -118,6 +124,8 @@ static int init_jack(const char *client_name)
 
   jack_set_process_callback(j_client, process, 0);
 
+  jack_on_shutdown(j_client, jack_shutdown, NULL);
+
   j_samplerate = jack_get_sample_rate(j_client);
   return (0);
 }
@@ -140,18 +148,17 @@ static int jack_portsetup(void)
   return (0);
 }
 
-static void jack_port_connect(char **jack_port, int argc)
+static void jack_port_connect()
 {
-  int i;
-  for (i = 0; i < argc; i++)
-  {
-    if (!jack_port[i])
-      continue;
-    if (jack_connect(j_client, jack_port[i], jack_port_name(input_port)))
-    {
-      fprintf(stderr, "cannot connect port %s to %s\n", jack_port[i], jack_port_name(input_port));
+    if (!jack_port_by_name(j_client, "system:capture_4")){
+      fprintf(stderr, "no port named capture_4");
+      return;
     }
-  }
+    if (jack_connect(j_client, "system:capture_4", jack_port_name(input_port)))
+    {
+      fprintf(stderr, "cannot connect port %s to %s\n", "capture_4", jack_port_name(input_port));
+    }
+
 }
 
 /**
@@ -165,7 +172,7 @@ static void my_decoder_read(LTCDecoder *d)
   {
 
     SMPTETimecode stime;
-    ltc_frame_to_time(&stime, &frame.ltc, 0);
+    ltc_frame_to_time(&stime, &frame.ltc, /* use_date? LTC_USE_DATE : */ 0);
 
     erase();
     attron(COLOR_PAIR(3));
@@ -196,13 +203,18 @@ static void my_decoder_read(LTCDecoder *d)
       }
       mvprintw(3, 0, "section: %s", partmap[currentMin]->sectionName);
 
-      mvprintw(5, 0, "notes: %s", partmap[currentMin]->notes);
+      mvprintw(4, 0, "notes: %s", partmap[currentMin]->notes);
       attron(COLOR_PAIR(2));
-      mvprintw(7, 0, "ends with: %s", partmap[currentMin]->endsWith);
+      mvprintw(5, 0, "ends with: %s", partmap[currentMin]->endsWith);
       attroff(COLOR_PAIR(2));
+      if (partmap[currentMin]->length != 0) {
+        mvprintw(7, 0, "upcoming: %s, at %d:00", partmap[partmap[currentMin]->start + partmap[currentMin]->length]->sectionName, partmap[partmap[currentMin]->start + partmap[currentMin]->length]->start);
+        
+      };
     }
   }
   refresh();
+  fflush(stdout);
 }
 
 /**
@@ -210,14 +222,15 @@ static void my_decoder_read(LTCDecoder *d)
  */
 static void main_loop(void)
 {
-  // added while not sure if that makes sense
-  while (pthread_mutex_lock(&ltc_thread_lock) == 0);
+  if (pthread_mutex_trylock(&ltc_thread_lock) == 0)
+  {
+    keep_running = 0;
+  };
+  // pthread_mutex_lock(&ltc_thread_lock);
 
   while (keep_running)
   {
     my_decoder_read(decoder);
-    if (!keep_running)
-      break;
     pthread_cond_wait(&data_ready, &ltc_thread_lock);
   }
 
@@ -226,85 +239,18 @@ static void main_loop(void)
 
 void catchsig(int sig)
 {
+
+  signal(SIGHUP, catchsig);
+
   fprintf(stderr, "caught signal - shutting down.\n");
   keep_running = 0;
   pthread_cond_signal(&data_ready);
-  pthread_mutex_unlock(&ltc_thread_lock);
-  jack_client_close(j_client);
-  exit(0);
 }
-
-/**************************
- * main application code
- */
-
-static struct option const long_options[] =
-    {
-        {"help", no_argument, 0, 'h'},
-        {"fps", required_argument, 0, 'f'},
-        {"version", no_argument, 0, 'V'},
-        {NULL, 0, NULL, 0}};
-
-static void usage(int status)
-{
-  printf("jltcdump - very simple JACK client to parse linear time code.\n\n");
-  printf("Usage: jltcdump [ OPTIONS ] [ JACK-PORTS ]\n\n");
-  printf("Options:\n\
-  -f, --fps  <num>[/den]     set expected framerate (default 25/1)\n\
-  -h, --help                 display this help and exit\n\
-  -V, --version              print version information and exit\n\
-\n\n");
-  printf("Report bugs to Robin Gareus <robin@gareus.org>\n"
-         "Website and manual: <https://github.com/x42/ltc-tools>\n");
-  exit(status);
-}
-
-static int decode_switches(int argc, char **argv)
-{
-  int c;
-
-  while ((c = getopt_long(argc, argv,
-                          "h"  /* help */
-                          "f:" /* fps */
-                          "V", /* version */
-                          long_options, (int *)0)) != EOF)
-  {
-    switch (c)
-    {
-    case 'f':
-    {
-      fps_num = atoi(optarg);
-      char *tmp = strchr(optarg, '/');
-      if (tmp)
-        fps_den = atoi(++tmp);
-    }
-    break;
-
-    case 'V':
-      printf("timecode for RT60, based on Robin Gareus' jack-ltc-dump %s\n\n", VERSION);
-      printf("Copyright (C) GPL 2006,2012,2013 Robin Gareus <robin@gareus.org>\n");
-      printf("Copyright (C) GPL 2022 Laurens Inauen\n");
-      exit(0);
-
-    case 'h':
-      usage(0);
-
-    default:
-      usage(EXIT_FAILURE);
-    }
-  }
-
-  return optind;
-}
-
 
 int main(int argc, char **argv)
 {
-  int i;
 
-  i = decode_switches(argc, argv);
-
-  signal(SIGINT, catchsig);
+  // -=-=-= INITIALIZE =-=-=-
 
   initscr();
   curs_set(0);
@@ -320,18 +266,18 @@ int main(int argc, char **argv)
 
   struct event parts[NR_OF_PARTS] = {
       {0, "permutation with overlap", "karplus direct to fft",
-       "cont."},
-      {8, "lars + candid + olive", "silence", "cont."},
-      {11, "around one pitch", "silence", "cont."},
-      {15, "michel + candid + drums", "silence", "cont."},
-      {23, "lisa + michel", "maybe some texture", "cont."},
-      {31, "benoit + morgan", "silence", "BREAK"},
-      {36, "benoit + morgan again", "silence", "cont."},
-      {40, "free at last", "guitar -> amp -> fft", "cont."},
-      {50, "textural midi piano", "come in with texture in the end", "METAL"},
-      {58, "ambivalent metal", "chug chug", "cont."},
-      {64, "soft intense, michel + morgan", "noise", "cont."},
-      {70, "end", "end", "end"}};
+       "cont.", 8},
+      {8, "lars + candid + olive", "silence", "cont.", 3},
+      {11, "around one pitch", "silence", "cont.",4},
+      {15, "michel + candid + drums", "silence", "cont.",8},
+      {23, "lisa + michel", "maybe some texture", "cont.",8},
+      {31, "benoit + morgan", "silence", "BREAK",5},
+      {36, "benoit + morgan again", "silence", "cont.", 4},
+      {40, "free at last", "guitar -> amp -> fft", "cont.", 10},
+      {50, "textural midi piano", "come in with texture in the end", "METAL", 8},
+      {58, "ambivalent metal", "chug chug", "cont.", 6},
+      {64, "soft intense, michel + morgan", "noise", "cont.", 6},
+      {70, "end", "end", "end", 0}};
 
   for (int i = 0; i < NR_OF_PARTS; i++)
   {
@@ -350,7 +296,6 @@ int main(int argc, char **argv)
       partmap[j] = &parts[i];
     }
   }
-  // --> do something so that events are printed out while they occur...
 
   if (init_jack("timecodeRT60"))
     goto out;
@@ -358,16 +303,23 @@ int main(int argc, char **argv)
   if (jack_portsetup())
     goto out;
 
+  if (mlockall(MCL_CURRENT | MCL_FUTURE))
+  {
+    fprintf(stderr, "Warning: Can not lock memory.\n");
+  }
+
   if (jack_activate(j_client))
   {
     fprintf(stderr, "cannot activate client.\n");
     goto out;
   }
 
-  jack_port_connect(&(argv[i]), argc - i);
+  jack_port_connect();
 
-  printw("ready...\n");
-  refresh();
+  signal(SIGHUP, catchsig);
+  signal(SIGINT, catchsig);
+
+  printw("waiting for timecode...\n");
 
   main_loop();
 
@@ -379,7 +331,6 @@ out:
   }
   ltc_decoder_free(decoder);
   fprintf(stderr, "bye.\n");
-  endwin();
 
   return (0);
 }
