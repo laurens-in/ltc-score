@@ -25,12 +25,6 @@
 #define VERSION "1"
 #endif
 
-#ifdef WIN32
-#include <windows.h>
-#include <pthread.h>
-#define pthread_t //< override jack.h def
-#endif
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -41,11 +35,9 @@
 #include <ltc.h>
 #include <ncurses.h>
 
-#ifndef WIN32
 #include <sys/mman.h>
 #include <signal.h>
 #include <pthread.h>
-#endif
 
 #define NR_OF_PARTS 12
 #define NR_OF_MINUTES 110
@@ -54,7 +46,7 @@ static int keep_running = 1;
 
 static jack_port_t *input_port = NULL;
 static jack_client_t *j_client = NULL;
-static uint32_t j_samplerate = 48000;
+static uint32_t j_samplerate = 44100;
 
 static LTCDecoder *decoder = NULL;
 
@@ -130,9 +122,8 @@ static int init_jack(const char *client_name)
 
   jack_set_process_callback(j_client, process, 0);
 
-#ifndef WIN32
   jack_on_shutdown(j_client, jack_shutdown, NULL);
-#endif
+
   j_samplerate = jack_get_sample_rate(j_client);
   return (0);
 }
@@ -218,6 +209,7 @@ static void my_decoder_read(LTCDecoder *d)
     }
   }
   refresh();
+  fflush(stdout);
 }
 
 /**
@@ -225,14 +217,29 @@ static void my_decoder_read(LTCDecoder *d)
  */
 static void main_loop(void)
 {
-  pthread_mutex_lock(&ltc_thread_lock);
+  mvprintw(0, 0, "enter main_loop");
+  refresh();
+  // problem is here
+
+  if (pthread_mutex_trylock(&ltc_thread_lock) == 0)
+  {
+    keep_running = 0;
+  };
+  // pthread_mutex_lock(&ltc_thread_lock);
+  mvprintw(2, 0, "mutex locked");
+  refresh();
 
   while (keep_running)
   {
+    mvprintw(1, 0, "enter loop inside main_loop");
+    refresh();
     my_decoder_read(decoder);
-    if (!keep_running)
-      break;
+    mvprintw(1, 0, "decoder read");
+    // if (!keep_running)
+    //   break;
     pthread_cond_wait(&data_ready, &ltc_thread_lock);
+    mvprintw(1, 0, "thred notified");
+    refresh();
   }
 
   pthread_mutex_unlock(&ltc_thread_lock);
@@ -240,9 +247,9 @@ static void main_loop(void)
 
 void catchsig(int sig)
 {
-#ifndef _WIN32
+
   signal(SIGHUP, catchsig);
-#endif
+
   fprintf(stderr, "caught signal - shutting down.\n");
   keep_running = 0;
   pthread_cond_signal(&data_ready);
@@ -363,18 +370,16 @@ int main(int argc, char **argv)
     }
   }
 
-  if (init_jack("jack-ltc-dump"))
+  if (init_jack("timecodeRT60"))
     goto out;
 
   if (jack_portsetup())
     goto out;
 
-#ifndef WIN32
   if (mlockall(MCL_CURRENT | MCL_FUTURE))
   {
     fprintf(stderr, "Warning: Can not lock memory.\n");
   }
-#endif
 
   if (jack_activate(j_client))
   {
@@ -384,13 +389,10 @@ int main(int argc, char **argv)
 
   jack_port_connect(&(argv[i]), argc - i);
 
-#ifndef _WIN32
   signal(SIGHUP, catchsig);
   signal(SIGINT, catchsig);
-#endif
 
   printw("ready...\n");
-  refresh();
 
   main_loop();
 
