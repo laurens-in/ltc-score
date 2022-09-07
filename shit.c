@@ -59,15 +59,29 @@ static int fps_den = 1;
 // represent event in score
 struct event
 {
+  int id;
   int start;
   char *sectionName;
   char *notes;
   char *endsWith;
-  // super dumb but no time for smart solutions
-  int length;
 };
 
 struct event *partmap[NR_OF_MINUTES];
+
+static struct event parts[NR_OF_PARTS] = {
+    {0, 0, "permutation with overlap", "karplus direct to fft",
+     "cont."},
+    {1, 8, "lars + candid + olive", "silence", "cont."},
+    {2, 11, "around one pitch", "silence", "cont."},
+    {3, 15, "michel + candid + drums", "silence", "cont."},
+    {4, 23, "lisa + michel", "maybe some texture", "cont."},
+    {5, 31, "benoit + morgan", "silence", "BREAK"},
+    {6, 36, "benoit + morgan again", "silence", "cont."},
+    {7, 40, "free at last", "guitar -> amp -> fft", "cont."},
+    {8, 50, "textural midi piano", "come in with texture in the end", "METAL"},
+    {9, 58, "ambivalent metal", "chug chug", "cont."},
+    {10, 64, "soft intense, michel + morgan", "noise", "cont."},
+    {11, 70, "end", "end", "end"}};
 
 /**
  * jack audio process callback
@@ -192,15 +206,13 @@ static void my_decoder_read(LTCDecoder *d)
     {
       if (partmap[currentMin] != partmap[currentMin + 1])
       {
-        if (stime.secs >= 40)
+
+        if (stime.secs % 2 == 0)
         {
-          if (stime.secs % 2 == 0)
-          {
-            attron(COLOR_PAIR(1));
-          }
-          mvprintw(2, 0, "time remaining: %02d ", 60 - stime.secs);
-          attroff(COLOR_PAIR(1));
+          attron(COLOR_PAIR(1));
         }
+        mvprintw(2, 0, "time remaining: %02d ", 60 - stime.secs);
+        attroff(COLOR_PAIR(1));
       }
       mvprintw(3, 0, "section: %s", partmap[currentMin]->sectionName);
 
@@ -208,10 +220,8 @@ static void my_decoder_read(LTCDecoder *d)
       attron(COLOR_PAIR(2));
       mvprintw(5, 0, "ends with: %s", partmap[currentMin]->endsWith);
       attroff(COLOR_PAIR(2));
-      if (partmap[currentMin]->length != 0) {
-        mvprintw(7, 0, "upcoming: %s, at %d:00", partmap[partmap[currentMin]->start + partmap[currentMin]->length]->sectionName, partmap[partmap[currentMin]->start + partmap[currentMin]->length]->start);
-        
-      };
+      // if (partmap[currentMin]->id < 11)
+      //   mvprintw(6, 0, "upcoming: %s", parts[partmap[currentMin + 1]->id].sectionName);
     }
   }
   refresh();
@@ -223,11 +233,11 @@ static void my_decoder_read(LTCDecoder *d)
  */
 static void main_loop(void)
 {
-  if (pthread_mutex_trylock(&ltc_thread_lock) == 0)
-  {
-    keep_running = 0;
-  };
-  // pthread_mutex_lock(&ltc_thread_lock);
+  // if (pthread_mutex_trylock(&ltc_thread_lock) == 0)
+  // {
+  //   keep_running = 0;
+  // };
+  pthread_mutex_lock(&ltc_thread_lock);
 
   while (keep_running)
   {
@@ -327,23 +337,6 @@ int main(int argc, char **argv)
   init_pair(3, COLOR_MAGENTA, -1);
 
   // -=-=-= INITIALIZE =-=-=-
-
-  // enter notes here
-
-  struct event parts[NR_OF_PARTS] = {
-      {0, "permutation with overlap", "karplus direct to fft",
-       "cont.", 8},
-      {8, "lars + candid + olive", "silence", "cont.", 3},
-      {11, "around one pitch", "silence", "cont.",4},
-      {15, "michel + candid + drums", "silence", "cont.",8},
-      {23, "lisa + michel", "maybe some texture", "cont.",8},
-      {31, "benoit + morgan", "silence", "BREAK",5},
-      {36, "benoit + morgan again", "silence", "cont.", 4},
-      {40, "free at last", "guitar -> amp -> fft", "cont.", 10},
-      {50, "textural midi piano", "come in with texture in the end", "METAL", 8},
-      {58, "ambivalent metal", "chug chug", "cont.", 6},
-      {64, "soft intense, michel + morgan", "noise", "cont.", 6},
-      {70, "end", "end", "end", 0}};
 
   for (int i = 0; i < NR_OF_PARTS; i++)
   {
